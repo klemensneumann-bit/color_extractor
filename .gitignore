@@ -1,0 +1,10 @@
+# Local editor settings
+.vs/
+.vscode/
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.autosave
+Thumbs.db
+Desktop.ini
