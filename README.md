@@ -2,6 +2,8 @@
 
 Extract a dominant-color palette from an image in 3ds Max and transfer it to native map nodes for Arnold, Corona, FStorm, or V-Ray. Extraction and color copying also work without these renderer plugins installed.
 
+![Color Extractor interface in 3ds Max](docs/Screenshot_ColorExtractor.jpg)
+
 ## Usage
 
 1. Run `ColorExtractor.ms` through **Scripting > Run Script**.
