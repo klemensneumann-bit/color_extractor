@@ -1,16 +1,31 @@
-(
+﻿(
 -- Thumbnail viewer + dominant colour extractor
 -- Image load/display: MaxScript dotNet bridge (PictureBox)
 -- Color extraction: C# class compiled at runtime via CSharpCodeProvider
 --   -> blur, pixel sampling and k-means all run inside .NET
 --   -> returns a plain int[] (R,G,B triplets) that MaxScript reads safely
--- No file lock. No temp files. No dotNet bridge overload issues.
+-- Mask preview and weighted Lab k-means run inside the C# helper.
 
 dotNet.loadAssembly "System.Drawing"
 dotNet.loadAssembly "System.Windows.Forms"
 
 global ColorExtractor_rollout -- the main dialog
-local ce_Version = "0.2"
+local ce_Version = "0.5"
+-- Palette capacity matches the fixed swatch row below.
+local ce_MinPaletteColors = 2
+local ce_MaxPaletteColors = 16
+local ce_DefaultIgnoreBackground = false
+local ce_DefaultThreshold = 10.0
+local ce_DefaultSoftness = 5.0
+local ce_DefaultLinear = true
+local ce_MaxMaskDistance = 250.0
+local ce_MapRandomSeed = 42
+local ce_EmptySwatchColor = color 20 20 20
+local ce_ExtractionBlurPasses = 2
+local ce_ExtractionMaxSamples = 1000
+local ce_FStormLegacyRandomSlots = 4
+local ce_FStormExpandedRandomSlots = 8
+local ce_PreviewBitmap  = undefined
 local ce_ThumbBitmap    = undefined
 local ce_DominantColors = #()
 local ce_ColorExtractor = undefined   -- compiled C# instance, created once
@@ -21,28 +36,166 @@ local ce_ColorExtractor = undefined   -- compiled C# instance, created once
 -- Unknown version formats default to 4 rather than assuming 8 slots exist.
 fn fstormRandomColorLimit rendererClassName = (
     local versionMatch = (dotNetClass "System.Text.RegularExpressions.Regex").Match rendererClassName "^FStormRender_v([0-9]+)_([0-9]+)_([0-9]+)([a-z]?)[0-9]*$" (dotNetClass "System.Text.RegularExpressions.RegexOptions").IgnoreCase
-    if not versionMatch.Success do return 4
+    if not versionMatch.Success do return ce_FStormLegacyRandomSlots
 
     local minimumVersion = #(1, 5, 4)
     for i = 1 to 3 do (
         local component = (versionMatch.Groups.Item[i].Value as string) as integer
-        if component > minimumVersion[i] do return 8
-        if component < minimumVersion[i] do return 4
+        if component > minimumVersion[i] do return ce_FStormExpandedRandomSlots
+        if component < minimumVersion[i] do return ce_FStormLegacyRandomSlots
     )
     -- For 1.5.4 itself, no suffix and suffix 'a' precede the 'b' update.
     local suffix = toLower (versionMatch.Groups.Item[4].Value as string)
     local suffixRank = findString "abcdefghijklmnopqrstuvwxyz" suffix
-    if suffix != "" and suffixRank != undefined and suffixRank >= 2 then 8 else 4
+    if suffix != "" and suffixRank != undefined and suffixRank >= 2 then ce_FStormExpandedRandomSlots else ce_FStormLegacyRandomSlots
+)
+
+-- Discover registered plugin classes without instantiating a renderer or
+-- changing renderers.current. Map construction is guarded separately below.
+struct CE_PaletteMapResult (texture, colorCount)
+struct CE_MapSupport (fstormRendererClassName, randomColorClass, multiTexClass, vrayClass, coronaClass, arnoldClass)
+
+fn findRegisteredClass classList classPattern = (
+    for candidate in classList do (
+        if matchPattern (candidate as string) pattern:classPattern ignoreCase:true do return candidate
+    )
+    undefined
+)
+
+fn discoverPaletteMapSupport = (
+    local support = CE_MapSupport()
+    local installedRendererType = findRegisteredClass RendererClass.classes "FStormRender_*"
+    if installedRendererType != undefined do (
+        support.fstormRendererClassName = installedRendererType as string
+        support.randomColorClass = findRegisteredClass textureMap.classes "FStormRandomColor"
+        support.multiTexClass = findRegisteredClass textureMap.classes "FStormMultiTex"
+    )
+    support.vrayClass = findRegisteredClass textureMap.classes "VRayMultiSubTex"
+    support.coronaClass = findRegisteredClass textureMap.classes "CoronaMultiMap"
+    support.arnoldClass = findRegisteredClass textureMap.classes "ai_switch_rgba"
+    support
+)
+
+fn paletteMapClass support mapKind = (
+    if support == undefined do return undefined
+    case mapKind of (
+        #randomColor: (if support.fstormRendererClassName != undefined then support.randomColorClass else undefined)
+        #multiTex: (if support.fstormRendererClassName != undefined then support.multiTexClass else undefined)
+        #vray: support.vrayClass
+        #corona: support.coronaClass
+        #arnold: support.arnoldClass
+        default: undefined
+    )
+)
+
+fn createPaletteMap support mapKind palette = (
+    if palette.count == 0 do return undefined
+    local mapClass = paletteMapClass support mapKind
+    if mapClass == undefined do return undefined
+    -- Use the discovered class value: missing plugin symbols are never invoked.
+    local m = mapClass()
+    case mapKind of (
+        #randomColor: (
+            local n = amin #(fstormRandomColorLimit support.fstormRendererClassName, m.colors.count, m.chances.count, palette.count)
+            if n < 1 do return undefined
+            for i = 1 to n do m.colors[i] = palette[i]
+            for i = 1 to m.chances.count do m.chances[i] = if i <= n then (1.0 / n) else 0.0
+            m.id_source = 0
+            m.mix_value = 1.0
+            m.random_seed = ce_MapRandomSeed
+            CE_PaletteMapResult texture:m colorCount:n
+        )
+        #multiTex: (
+            -- Set individual slots: plugin arrays have a fixed capacity.
+            local n = amin #(ce_MaxPaletteColors, palette.count, m.colors.count, m.ids.count, m.textures.count, m.textures_on.count)
+            if n < 1 do return undefined
+            m.num_ids = n
+            -- Some versions may clamp the requested active slot count.
+            n = amin #(n, m.num_ids)
+            for i = 1 to n do (
+                m.ids[i] = i
+                m.colors[i] = palette[i]
+                m.textures[i] = undefined
+                -- Preserve the enabled default for each active entry.
+                m.textures_on[i] = true
+            )
+            -- Keep the plugin's default ID-source mode.
+            m.random_seed = ce_MapRandomSeed
+            CE_PaletteMapResult texture:m colorCount:n
+        )
+        #vray: (
+            local n = amin #(ce_MaxPaletteColors, palette.count)
+            -- Published interface resizes all parallel slot arrays together.
+            m.texmap_num = n
+            if m.texmap_color.count != n do throw "V-Ray palette slot count was not accepted"
+            for i = 1 to n do (
+                m.texmap_color[i] = palette[i]
+                m.texmap_id[i] = i
+                m.texmap_on[i] = true
+                m.texmap[i] = undefined
+                m.texmap_mapOn[i] = false
+                m.texmap_mult[i] = 100.0
+            )
+            m.default_color = palette[1]
+            m.default_texmap_on = false
+            m.random_hue = 0
+            m.random_saturation = 0
+            m.random_gamma = 0
+            m.seed = ce_MapRandomSeed
+            -- Preserve the default ID-source mode; do not guess plugin enums.
+            CE_PaletteMapResult texture:m colorCount:n
+        )
+        #corona: (
+            local n = amin #(ce_MaxPaletteColors, palette.count, m.colors.count, m.frequency.count, m.texmaps.count, m.texmapsOn.count)
+            if n < 1 do return undefined
+            m.items = n
+            if m.items != n do throw "Corona palette slot count was not accepted"
+            for i = 1 to n do (
+                m.colors[i] = palette[i]
+                m.frequency[i] = 1.0
+                m.texmaps[i] = undefined
+                m.texmapsOn[i] = false
+            )
+            m.mixAmount = 0
+            m.hueRandom = 0
+            m.saturationRandom = 0
+            m.gammaRandom = 0
+            -- Clear every installed randomization flag, including version additions.
+            for p in getPropNames m where matchPattern (p as string) pattern:"randomize*" do setProperty m p false
+            m.randomizeInstance = true
+            m.seed = ce_MapRandomSeed
+            CE_PaletteMapResult texture:m colorCount:n
+        )
+        #arnold: (
+            local capacity = 0
+            while isProperty m ("input" + capacity as string) do capacity += 1
+            local n = amin #(ce_MaxPaletteColors, palette.count, capacity)
+            if n < 1 do return undefined
+            for i = 0 to capacity - 1 do (
+                local p = "input" + i as string
+                -- Unused inputs repeat the first color rather than producing black.
+                setProperty m p palette[(if i < n then i + 1 else 1)]
+                setProperty m (p + "_shader") undefined
+                setProperty m (p + "_connected") false
+            )
+            m.index = 0
+            m.index_shader = undefined
+            m.index_connected = false
+            CE_PaletteMapResult texture:m colorCount:n
+        )
+        default: undefined
+    )
 )
 
 --------------------------------------------------------------------------------
---------------------------------------------------------------------------------
--- 1.  Compile the C# color extractor (called once on first use)
+-- 1. Compile the managed image helper and native swatch input guard
 --     C# source is embedded directly — quotes escaped as \" for MaxScript.
---     Compiled in-memory — no DLL or temp file written to disk.
+--     The assembly stays in memory; temporary source is deleted after compilation.
 --------------------------------------------------------------------------------
 fn compileColorExtractor = (
     local result = undefined
+    local tmpBase = undefined
+    local csFile = undefined
     try (
         local src = "using System;
 using System.Drawing;
@@ -51,23 +204,41 @@ using System.Runtime.InteropServices;
 using System.IO;
 using System.Windows.Media.Imaging;
 using System.Windows.Media;
+using System.Windows.Forms;
+using Color = System.Drawing.Color;
+using PixelFormat = System.Drawing.Imaging.PixelFormat;
+
+// Keep Max's native right-click color clipboard while blocking the editor.
+public class PaletteSwatchWindow : NativeWindow
+{
+    public PaletteSwatchWindow(long hwnd) { AssignHandle(new IntPtr(hwnd)); }
+    protected override void WndProc(ref Message message)
+    {
+        const int LeftDown = 0x0201, LeftUp = 0x0202, LeftDoubleClick = 0x0203;
+        const int KeyDown = 0x0100, KeyUp = 0x0101, Character = 0x0102;
+        if (message.Msg == LeftDown || message.Msg == LeftUp || message.Msg == LeftDoubleClick ||
+            message.Msg == KeyDown || message.Msg == KeyUp || message.Msg == Character)
+        {
+            message.Result = IntPtr.Zero;
+            return;
+        }
+        base.WndProc(ref message);
+    }
+}
 
 public class ColorExtractor
 {
-    // ==========================================================================
-    // LoadThumbnail — three-stage fast path, called from MaxScript instead of
-    // the old pure-MaxScript loadThumbBitmap fn.
-    //
-    // Stage 1: Windows Shell thumbnail cache (instantaneous, no file decode)
-    //          Works for any format Explorer has indexed. Uses IShellItemImageFactory
-    //          via Shell32 COM interop.
-    // Stage 2: WPF BitmapDecoder with scale hint (fast for JPEG/TIFF/PNG/BMP)
-    //          Never fully decodes the image — the JPEG decoder skips DCT blocks
-    //          that fall outside the target resolution, making a 100 MB file
-    //          decode in roughly the same time as a 1 MB file at thumb size.
-    // Stage 3: GDI+ full decode fallback (EXR, HDR, TGA via Max codecs)
-    //          Same as before — reads via non-locking FileStream.
-    // ==========================================================================
+    private readonly System.Collections.Generic.List<PaletteSwatchWindow> swatches =
+        new System.Collections.Generic.List<PaletteSwatchWindow>();
+    public int ProtectedPaletteSwatchCount { get { return swatches.Count; } }
+    public void ProtectPaletteSwatch(long hwnd) { swatches.Add(new PaletteSwatchWindow(hwnd)); }
+    public void ReleasePaletteSwatches()
+    {
+        foreach (PaletteSwatchWindow swatch in swatches) swatch.ReleaseHandle();
+        swatches.Clear();
+    }
+
+    // Try Windows thumbnails, then WPF and GDI+ decoders without retaining file locks.
     public Bitmap LoadThumbnail(string filePath, int maxW, int maxH)
     {
         // ---- Stage 1: Shell cache ------------------------------------------
@@ -78,7 +249,7 @@ public class ColorExtractor
         }
         catch { }
 
-        // ---- Stage 2: WPF BitmapDecoder with scale hint --------------------
+        // ---- Stage 2: WPF BitmapDecoder ------------------------------------
         try
         {
             Bitmap wpf = LoadWithBitmapDecoder(filePath, maxW, maxH);
@@ -93,20 +264,7 @@ public class ColorExtractor
     // --------------------------------------------------------------------------
     // Stage 1 — Shell thumbnail cache
     // Uses IShellItemImageFactory (Shell32) to get the cached Explorer thumbnail.
-    // This never touches the file on disk if the cache is warm.
     // --------------------------------------------------------------------------
-    [ComImport]
-    [Guid(\"43826d1e-e718-42ee-bc55-a1e261c37bfe\")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface IShellItem
-    {
-        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
-        void GetParent(out IShellItem ppsi);
-        void GetDisplayName(uint sigdnName, out IntPtr ppszName);
-        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
-        void Compare(IShellItem psi, uint hint, out int piOrder);
-    }
-
     [ComImport]
     [Guid(\"bcc18b79-ba16-442f-80c4-8a59c30c463b\")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -199,21 +357,18 @@ public class ColorExtractor
     [DllImport(\"gdi32.dll\")] private static extern bool DeleteObject(IntPtr hObject);
 
     // --------------------------------------------------------------------------
-    // Stage 2 — WPF BitmapDecoder
-    // DecodePixelWidth/Height tells the codec the target size. JPEG decoders
-    // honour this by skipping unnecessary DCT coefficient blocks — a 50 MP JPEG
-    // decoded to 256 px takes roughly the same time as a 1 MP JPEG.
+    // Stage 2 — WPF BitmapDecoder (eager load releases the source stream)
     // --------------------------------------------------------------------------
     private static Bitmap LoadWithBitmapDecoder(string filePath, int maxW, int maxH)
     {
-        Uri uri = new Uri(filePath, UriKind.Absolute);
-
-        BitmapDecoder decoder = BitmapDecoder.Create(
-            uri,
-            BitmapCreateOptions.DelayCreation,
-            BitmapCacheOption.None);
-
-        BitmapFrame frame = decoder.Frames[0];
+        BitmapFrame frame;
+        using (var fs = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            BitmapDecoder decoder = BitmapDecoder.Create(fs,
+                BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+            frame = decoder.Frames[0];
+            frame.Freeze();
+        }
 
         // Compute aspect-correct decode size
         double scaleX = (double)maxW / frame.PixelWidth;
@@ -222,7 +377,7 @@ public class ColorExtractor
         int tw = Math.Max(1, (int)(frame.PixelWidth  * scale));
         int th = Math.Max(1, (int)(frame.PixelHeight * scale));
 
-        // ScaledBitmapSource hints the decoder to the target size
+        // Resize the decoded frame
         var scaled = new TransformedBitmap(frame,
             new ScaleTransform((double)tw / frame.PixelWidth,
                                (double)th / frame.PixelHeight));
@@ -276,137 +431,248 @@ public class ColorExtractor
         return dst;
     }
 
-    // ==========================================================================
-    // ExtractColors — unchanged, operates on the already-loaded thumbnail Bitmap
-    // ==========================================================================
+    private bool maskEnabled;
+    private double[] backgroundLab = new double[3];
+    private double threshold = 10, softness = 5;
+    private double[] clusterWeights = new double[0];
+
+    public void ConfigureMask(bool enabled, int r, int g, int b, double tolerance, double feather)
+    {
+        maskEnabled = enabled;
+        backgroundLab = ToLab(r, g, b);
+        threshold = Math.Max(0, tolerance);
+        softness = Math.Max(0, feather);
+    }
+
+    public double[] GetClusterWeights() { return (double[])clusterWeights.Clone(); }
+
+    private double Weight(double[] lab, byte alpha)
+    {
+        double w = alpha / 255.0;
+        if (!maskEnabled) return w;
+        double d = Math.Sqrt(Distance(lab, backgroundLab));
+        if (d <= threshold) return 0;
+        if (softness <= 0 || d >= threshold + softness) return w;
+        double t = (d - threshold) / softness;
+        return w * t * t * (3 - 2 * t);
+    }
+
+    // Copy rows individually: negative stride must not produce negative offsets.
+    private static byte[] ReadPixels(Bitmap source)
+    {
+        using (Bitmap copy = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb))
+        {
+            using (Graphics g = Graphics.FromImage(copy))
+            {
+                g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                g.DrawImageUnscaled(source, 0, 0);
+            }
+            BitmapData bits = copy.LockBits(new Rectangle(0, 0, copy.Width, copy.Height),
+                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                byte[] pixels = new byte[copy.Width * copy.Height * 4];
+                for (int y = 0; y < copy.Height; y++)
+                    Marshal.Copy(IntPtr.Add(bits.Scan0, y * bits.Stride), pixels,
+                        y * copy.Width * 4, copy.Width * 4);
+                return pixels;
+            }
+            finally { copy.UnlockBits(bits); }
+        }
+    }
+
+    public Bitmap CreateMaskPreview(Bitmap source)
+    {
+        byte[] pixels = ReadPixels(source);
+        Bitmap preview = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb);
+        BitmapData bits = preview.LockBits(new Rectangle(0, 0, preview.Width, preview.Height),
+            ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            for (int i = 0; i < pixels.Length; i += 4)
+            {
+                double w = Weight(ToLab(pixels[i+2], pixels[i+1], pixels[i]), pixels[i+3]);
+                pixels[i] = (byte)Math.Round(pixels[i] * w + 255 * (1 - w));
+                pixels[i+1] = (byte)Math.Round(pixels[i+1] * w);
+                pixels[i+2] = (byte)Math.Round(pixels[i+2] * w + 255 * (1 - w));
+                pixels[i+3] = 255;
+            }
+            for (int y = 0; y < preview.Height; y++)
+                Marshal.Copy(pixels, y * preview.Width * 4,
+                    IntPtr.Add(bits.Scan0, y * bits.Stride), preview.Width * 4);
+        }
+        catch { preview.UnlockBits(bits); preview.Dispose(); throw; }
+        preview.UnlockBits(bits);
+        return preview;
+    }
+
+    // Pixel coordinates for a centered PictureBox Zoom image; margins are invalid.
+    public int[] PickPixel(Bitmap source, int clientW, int clientH, int x, int y)
+    {
+        if (clientW <= 0 || clientH <= 0) return new int[0];
+        double scale = Math.Min((double)clientW / source.Width, (double)clientH / source.Height);
+        int width = Math.Max(1, (int)(source.Width * scale));
+        int height = Math.Max(1, (int)(source.Height * scale));
+        int left = (clientW - width) / 2, top = (clientH - height) / 2;
+        if (x < left || x >= left + width || y < top || y >= top + height) return new int[0];
+        int px = Math.Min(source.Width - 1, (int)((x - left) * (double)source.Width / width));
+        int py = Math.Min(source.Height - 1, (int)((y - top) * (double)source.Height / height));
+        Color c = source.GetPixel(px, py);
+        if (c.A == 0) return new int[0];
+        return new int[] { c.R, c.G, c.B };
+    }
+
+    private class Sample
+    {
+        public double[] Lab;
+        public double Weight;
+        public Sample(double[] lab, double weight) { Lab = lab; Weight = weight; }
+    }
+
     public int[] ExtractColors(Bitmap bmp, int numColors, int blurStrength, int maxSamples, bool toLinear)
     {
-        // --- 1. Copy into a fresh same-size Bitmap --------------------------
-        Bitmap work = new Bitmap(bmp.Width, bmp.Height);
-        using (Graphics g = Graphics.FromImage(work))
+        clusterWeights = new double[0];
+        if (numColors < 1 || maxSamples < 1) return new int[0];
+        byte[] original = ReadPixels(bmp);
+        bool hasAlpha = false;
+        for (int i = 3; i < original.Length; i += 4) if (original[i] != 255) { hasAlpha = true; break; }
+        byte[] colors = original;
+        // Masked/transparent sources stay unblurred to prevent background bleed.
+        if (!maskEnabled && !hasAlpha && blurStrength > 0)
         {
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            g.DrawImage(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height));
-        }
-
-        // --- 2. Blur via downscale -> upscale (GDI bicubic acts as low-pass) -
-        for (int pass = 0; pass < blurStrength; pass++)
-        {
-            int hw = Math.Max(1, work.Width  / 4);
-            int hh = Math.Max(1, work.Height / 4);
-
-            Bitmap small = new Bitmap(hw, hh);
-            using (Graphics g = Graphics.FromImage(small))
+            using (Bitmap work = new Bitmap(bmp))
             {
-                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                g.DrawImage(work, new Rectangle(0, 0, hw, hh));
+                for (int pass = 0; pass < blurStrength; pass++)
+                using (Bitmap small = new Bitmap(Math.Max(1, bmp.Width / 4), Math.Max(1, bmp.Height / 4)))
+                {
+                    using (Graphics g = Graphics.FromImage(small))
+                    {
+                        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(work, new Rectangle(0, 0, small.Width, small.Height));
+                    }
+                    using (Graphics g = Graphics.FromImage(work))
+                    {
+                        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(small, new Rectangle(0, 0, work.Width, work.Height));
+                    }
+                }
+                colors = ReadPixels(work);
             }
-
-            Bitmap up = new Bitmap(work.Width, work.Height);
-            using (Graphics g = Graphics.FromImage(up))
-            {
-                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                g.DrawImage(small, new Rectangle(0, 0, work.Width, work.Height));
-            }
-            small.Dispose();
-            work.Dispose();
-            work = up;
         }
-
-        // --- 3. Sample pixels via LockBits ----------------------------------
-        int W = work.Width, H = work.Height;
-        int total = W * H;
-        int step  = Math.Max(1, total / maxSamples);
-
-        BitmapData bd = work.LockBits(
-            new Rectangle(0, 0, W, H),
-            ImageLockMode.ReadOnly,
-            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-        int stride  = bd.Stride;
-        byte[] data = new byte[Math.Abs(stride) * H];
-        Marshal.Copy(bd.Scan0, data, 0, data.Length);
-        work.UnlockBits(bd);
-        work.Dispose();
-
-        float[][] samples = new float[total / step + 1][];
-        int sCount = 0;
-        for (int idx = 0; idx < total; idx += step)
+        // Reservoir sampling among retained pixels: tiny foregrounds are not lost
+        // merely because the background occupies most of the thumbnail.
+        var samples = new System.Collections.Generic.List<Sample>();
+        Random random = new Random(42);
+        int seen = 0;
+        for (int i = 0; i < original.Length; i += 4)
         {
-            int px = idx % W;
-            int py = idx / W;
-            int off = py * stride + px * 4;
-            samples[sCount++] = new float[] {
-                data[off + 2],
-                data[off + 1],
-                data[off    ]
-            };
+            double[] originalLab = ToLab(original[i+2], original[i+1], original[i]);
+            double weight = Weight(originalLab, original[i+3]);
+            if (weight <= 0) continue;
+            Sample sample = new Sample(ToLab(colors[i+2], colors[i+1], colors[i]), weight);
+            seen++;
+            if (samples.Count < maxSamples) samples.Add(sample);
+            else { int slot = random.Next(seen); if (slot < maxSamples) samples[slot] = sample; }
         }
-
-        // --- 4. K-means -----------------------------------------------------
-        int k = Math.Min(numColors, sCount);
-        float[][] centroids = new float[k][];
-        int seedStep = sCount / k;
-        for (int j = 0; j < k; j++)
-            centroids[j] = (float[])samples[j * seedStep].Clone();
-
-        int[] assign = new int[sCount];
-
-        for (int iter = 0; iter < 20; iter++)
+        if (samples.Count == 0) return new int[0];
+        var centers = new System.Collections.Generic.List<double[]>();
+        double[] scores = new double[samples.Count];
+        for (int i = 0; i < scores.Length; i++) scores[i] = samples[i].Weight;
+        while (centers.Count < Math.Min(numColors, samples.Count))
+        {
+            double sum = 0;
+            for (int i = 0; i < scores.Length; i++) sum += scores[i];
+            if (sum <= 1e-12) break;
+            double target = random.NextDouble() * sum;
+            int chosen = scores.Length - 1;
+            for (int i = 0; i < scores.Length; i++) { target -= scores[i]; if (target < 0) { chosen = i; break; } }
+            centers.Add((double[])samples[chosen].Lab.Clone());
+            for (int i = 0; i < scores.Length; i++)
+            {
+                double nearest = double.MaxValue;
+                foreach (double[] center in centers) nearest = Math.Min(nearest, Distance(samples[i].Lab, center));
+                scores[i] = samples[i].Weight * nearest;
+            }
+        }
+        int k = centers.Count;
+        int[] assignments = new int[samples.Count];
+        for (int i = 0; i < assignments.Length; i++) assignments[i] = -1;
+        for (int iteration = 0; iteration < 50; iteration++)
         {
             bool changed = false;
-            for (int i = 0; i < sCount; i++)
+            double[,] sums = new double[k, 3];
+            double[] masses = new double[k];
+            for (int i = 0; i < samples.Count; i++)
             {
-                float bestD = float.MaxValue; int bestJ = 0;
-                for (int j = 0; j < k; j++)
-                {
-                    float dr = samples[i][0] - centroids[j][0];
-                    float dg = samples[i][1] - centroids[j][1];
-                    float db = samples[i][2] - centroids[j][2];
-                    float d  = dr*dr + dg*dg + db*db;
-                    if (d < bestD) { bestD = d; bestJ = j; }
-                }
-                if (assign[i] != bestJ) { assign[i] = bestJ; changed = true; }
-            }
-            if (!changed) break;
-
-            float[] sumR = new float[k], sumG = new float[k], sumB = new float[k];
-            int[]   cnt  = new int[k];
-            for (int i = 0; i < sCount; i++)
-            {
-                int j = assign[i];
-                sumR[j] += samples[i][0]; sumG[j] += samples[i][1]; sumB[j] += samples[i][2];
-                cnt[j]++;
+                int j = Nearest(samples[i].Lab, centers);
+                if (assignments[i] != j) changed = true;
+                assignments[i] = j;
+                masses[j] += samples[i].Weight;
+                for (int axis = 0; axis < 3; axis++) sums[j, axis] += samples[i].Weight * samples[i].Lab[axis];
             }
             for (int j = 0; j < k; j++)
-                if (cnt[j] > 0)
-                    centroids[j] = new float[] { sumR[j]/cnt[j], sumG[j]/cnt[j], sumB[j]/cnt[j] };
+                if (masses[j] > 0)
+                    for (int axis = 0; axis < 3; axis++) centers[j][axis] = sums[j, axis] / masses[j];
+            if (!changed) break;
         }
-
-        // --- 5. Sort by cluster size ----------------------------------------
-        int[] counts = new int[k];
-        for (int i = 0; i < sCount; i++) counts[assign[i]]++;
-        int[] order = new int[k];
-        for (int j = 0; j < k; j++) order[j] = j;
-        Array.Sort(order, (a, b2) => counts[b2].CompareTo(counts[a]));
-
-        // --- 6. sRGB -> linear (optional), return flat int[] ----------------
-        int[] result = new int[k * 3];
-        for (int j = 0; j < k; j++)
+        double[] counts = new double[k];
+        foreach (Sample sample in samples) counts[Nearest(sample.Lab, centers)] += sample.Weight;
+        var order = new System.Collections.Generic.List<int>();
+        for (int j = 0; j < k; j++) if (counts[j] > 0) order.Add(j);
+        order.Sort(delegate(int a, int b) { int c = counts[b].CompareTo(counts[a]); return c != 0 ? c : a.CompareTo(b); });
+        int[] result = new int[order.Count * 3];
+        clusterWeights = new double[order.Count];
+        double total = 0;
+        foreach (double count in counts) total += count;
+        for (int j = 0; j < order.Count; j++)
         {
-            float[] c = centroids[order[j]];
-            float r = c[0], g = c[1], b = c[2];
-            if (toLinear)
+            double[] rgb = FromLab(centers[order[j]]);
+            clusterWeights[j] = counts[order[j]] / total;
+            for (int axis = 0; axis < 3; axis++)
             {
-                r = SrgbToLinear(r / 255f) * 255f;
-                g = SrgbToLinear(g / 255f) * 255f;
-                b = SrgbToLinear(b / 255f) * 255f;
+                double c = Math.Max(0, Math.Min(1, rgb[axis]));
+                if (toLinear) c = SrgbToLinear((float)c);
+                result[j*3+axis] = (int)Math.Round(c * 255);
             }
-            result[j*3    ] = (int)Math.Round(Math.Max(0, Math.Min(255, r)));
-            result[j*3 + 1] = (int)Math.Round(Math.Max(0, Math.Min(255, g)));
-            result[j*3 + 2] = (int)Math.Round(Math.Max(0, Math.Min(255, b)));
         }
         return result;
+    }
+
+    private static int Nearest(double[] lab, System.Collections.Generic.List<double[]> centers)
+    {
+        int best = 0;
+        double distance = double.MaxValue;
+        for (int j = 0; j < centers.Count; j++)
+        {
+            double d = Distance(lab, centers[j]);
+            if (d < distance) { distance = d; best = j; }
+        }
+        return best;
+    }
+
+    private static double Distance(double[] a, double[] b)
+    {
+        double x = a[0]-b[0], y = a[1]-b[1], z = a[2]-b[2];
+        return x*x+y*y+z*z;
+    }
+
+    private static double LabF(double t) { return t > 216.0/24389 ? Math.Pow(t, 1.0/3) : (24389.0/27*t+16)/116; }
+    private static double LabInv(double t) { double cube = t*t*t; return cube > 216.0/24389 ? cube : (116*t-16)*27/24389; }
+    private static double[] ToLab(double r, double g, double b)
+    {
+        r = SrgbToLinear((float)(r/255)); g = SrgbToLinear((float)(g/255)); b = SrgbToLinear((float)(b/255));
+        double x = LabF((0.4124564*r+0.3575761*g+0.1804375*b)/0.95047);
+        double y = LabF(0.2126729*r+0.7151522*g+0.0721750*b);
+        double z = LabF((0.0193339*r+0.1191920*g+0.9503041*b)/1.08883);
+        return new double[] { 116*y-16, 500*(x-y), 200*(y-z) };
+    }
+    private static double Encode(double c) { return c <= 0.0031308 ? 12.92*c : 1.055*Math.Pow(c, 1.0/2.4)-0.055; }
+    private static double[] FromLab(double[] lab)
+    {
+        double fy = (lab[0]+16)/116;
+        double x = 0.95047*LabInv(fy+lab[1]/500), y = LabInv(fy), z = 1.08883*LabInv(fy-lab[2]/200);
+        return new double[] { Encode(3.2404542*x-1.5371385*y-0.4985314*z),
+            Encode(-0.9692660*x+1.8760108*y+0.0415560*z), Encode(0.0556434*x-0.2040259*y+1.0572252*z) };
     }
 
     private static float SrgbToLinear(float c)
@@ -423,6 +689,7 @@ public class ColorExtractor
         params.GenerateExecutable = false
         params.ReferencedAssemblies.Add "System.dll"
         params.ReferencedAssemblies.Add "System.Drawing.dll"
+        params.ReferencedAssemblies.Add "System.Windows.Forms.dll"
 
         -- Resolve WPF assembly paths via a real Type instance
         local typeClass = dotNetClass "System.Type"
@@ -434,9 +701,9 @@ public class ColorExtractor
         params.ReferencedAssemblies.Add xamlType.Assembly.Location
 
         -- Write to temp .cs, compile from file, delete temp
-        -- (CompileAssemblyFromSource takes string[] which MaxScript can't construct)
-        local tmpBase = (dotNetClass "System.IO.Path").GetTempFileName()
-        local csFile  = tmpBase + ".cs"
+        -- Use a typed string array for the compiler's source-file overload.
+        tmpBase = (dotNetClass "System.IO.Path").GetTempFileName()
+        csFile = tmpBase + ".cs"
         (dotNetClass "System.IO.File").WriteAllText csFile src
         (dotNetClass "System.IO.File").Delete tmpBase
 
@@ -445,7 +712,6 @@ public class ColorExtractor
         local strType   = (dotNetObject "System.String" "").GetType()
         local fileArray = al.ToArray strType
         local compResult = provider.CompileAssemblyFromFile params fileArray
-        try ((dotNetClass "System.IO.File").Delete csFile) catch()
 
         if compResult.Errors.HasErrors then (
             local sb = dotNetObject "System.Text.StringBuilder"
@@ -468,11 +734,13 @@ public class ColorExtractor
     ) catch (
         format "compileColorExtractor error: %\n" (getCurrentException())
     )
+    -- Also release temporary files when compilation or assembly loading fails.
+    for path in #(csFile, tmpBase) where path != undefined do try ((dotNetClass "System.IO.File").Delete path) catch()
     result
 )
 
 --------------------------------------------------------------------------------
--- 2. Load Thumbnail (no file locking because is handled via OS methods
+-- 2. Load a thumbnail without retaining a source-file lock
 --------------------------------------------------------------------------------
 fn loadThumbBitmap filePath maxW maxH = (
     local result = undefined
@@ -490,7 +758,7 @@ fn loadThumbBitmap filePath maxW maxH = (
 --------------------------------------------------------------------------------
 -- 3. Call C# extractor, convert flat int[] -> MaxScript color array
 --------------------------------------------------------------------------------
-fn extractDominantColors bmp numColors:16 blurStrength:2 maxSamples:1000 toLinear:false = (
+fn extractDominantColors bmp numColors:ce_MaxPaletteColors blurStrength:ce_ExtractionBlurPasses maxSamples:ce_ExtractionMaxSamples toLinear:false = (
     local result = #()
     try (
         -- Compile extractor on first use
@@ -512,9 +780,6 @@ fn extractDominantColors bmp numColors:16 blurStrength:2 maxSamples:1000 toLinea
             append result (color raw[i] raw[i+1] raw[i+2])
             i += 3
         )
---         format "Dominant colors (%):\n" result.count
---         for i = 1 to result.count do
---             format "  [%] %\n" i result[i]
     ) catch (
         format "extractDominantColors error: %\n" (getCurrentException())
     )
@@ -525,66 +790,370 @@ fn extractDominantColors bmp numColors:16 blurStrength:2 maxSamples:1000 toLinea
 -- 4. Rollout
 --------------------------------------------------------------------------------
 try(destroyDialog ColorExtractor_rollout)catch()
-rollout ColorExtractor_rollout ("Color Extractor v" + ce_Version) width:340 height:570 (
+rollout ColorExtractor_rollout ("Color Extractor v" + ce_Version) width:340 height:762 (
+
+    local installedMapSupport = undefined
+    local preferencesFile = (getDir #plugcfg) + "/ColorExtractor.ini"
+    local preferencesReady = false
 
     dotNetControl pb "System.Windows.Forms.PictureBox" width:310 height:290 pos:[15,10]
 
     label  lbl_info    ""               pos:[15,308] width:310 align:#left
     button btn_pick    "Pick image…"    pos:[15,326]  width:148 height:26
     button btn_clear   "Clear"          pos:[177,326] width:148 height:26
-    button btn_extract "Extract Colors" pos:[15,358]  width:220 height:26
-    checkbox chk_linear "Linear" pos:[242,362] checked:true
-    label  lbl_status  ""               pos:[15,390] width:310 align:#left
+    button btn_extract "Extract Colors" pos:[15,466] width:125 height:26
+    spinner spn_colors "Colors:" pos:[148,471] width:85 fieldWidth:32 range:[ce_MinPaletteColors,ce_MaxPaletteColors,ce_MaxPaletteColors] type:#integer tooltip:"Maximum number of dominant colors to extract"
+    checkbox chk_linear "Linear" pos:[242,471] checked:ce_DefaultLinear
+    label  lbl_status  ""               pos:[15,498] width:310 align:#left
+
+    groupBox grp_background "Background exclusion" pos:[15,358] width:310 height:100
+    checkbox chk_background "Ignore background" pos:[25,377] checked:ce_DefaultIgnoreBackground
+    checkbox chk_mask "Show mask" pos:[204,377] checked:true enabled:false
+    colorpicker cp_background "Color:" pos:[26,400] width:139 height:22 color:(color 255 255 255) modal:false enabled:false tooltip:"Background RGB from the unmodified thumbnail"
+    checkbutton btn_background "Pick from image" pos:[25,426] width:140 height:23 enabled:false
+    spinner spn_threshold "Threshold:" pos:[180,405] width:135 fieldWidth:48 range:[0,ce_MaxMaskDistance,ce_DefaultThreshold] type:#float scale:0.5 enabled:false tooltip:"Lab distance: colors at or below this value are excluded everywhere"
+    spinner spn_softness "Softness:" pos:[181,431] width:133 fieldWidth:48 range:[0,ce_MaxMaskDistance,ce_DefaultSoftness] type:#float scale:0.5 enabled:false tooltip:"Lab transition width; zero gives a hard mask"
 
     -- 16 colour swatches — left = most dominant, right = least
-    colorpicker cp1  "" pos:[13, 412] width:22 height:24 modal:false
-    colorpicker cp2  "" pos:[32, 412] width:22 height:24 modal:false
-    colorpicker cp3  "" pos:[51, 412] width:22 height:24 modal:false
-    colorpicker cp4  "" pos:[70, 412] width:22 height:24 modal:false
-    colorpicker cp5  "" pos:[89, 412] width:22 height:24 modal:false
-    colorpicker cp6  "" pos:[108,412] width:22 height:24 modal:false
-    colorpicker cp7  "" pos:[127,412] width:22 height:24 modal:false
-    colorpicker cp8  "" pos:[146,412] width:22 height:24 modal:false
-    colorpicker cp9  "" pos:[165,412] width:22 height:24 modal:false
-    colorpicker cp10 "" pos:[184,412] width:22 height:24 modal:false
-    colorpicker cp11 "" pos:[203,412] width:22 height:24 modal:false
-    colorpicker cp12 "" pos:[222,412] width:22 height:24 modal:false
-    colorpicker cp13 "" pos:[241,412] width:22 height:24 modal:false
-    colorpicker cp14 "" pos:[260,412] width:22 height:24 modal:false
-    colorpicker cp15 "" pos:[279,412] width:22 height:24 modal:false
-    colorpicker cp16 "" pos:[298,412] width:22 height:24 modal:false
+    colorpicker cp1  "" pos:[13, 522] width:22 height:24 modal:false
+    colorpicker cp2  "" pos:[32, 522] width:22 height:24 modal:false
+    colorpicker cp3  "" pos:[51, 522] width:22 height:24 modal:false
+    colorpicker cp4  "" pos:[70, 522] width:22 height:24 modal:false
+    colorpicker cp5  "" pos:[89, 522] width:22 height:24 modal:false
+    colorpicker cp6  "" pos:[108,522] width:22 height:24 modal:false
+    colorpicker cp7  "" pos:[127,522] width:22 height:24 modal:false
+    colorpicker cp8  "" pos:[146,522] width:22 height:24 modal:false
+    colorpicker cp9  "" pos:[165,522] width:22 height:24 modal:false
+    colorpicker cp10 "" pos:[184,522] width:22 height:24 modal:false
+    colorpicker cp11 "" pos:[203,522] width:22 height:24 modal:false
+    colorpicker cp12 "" pos:[222,522] width:22 height:24 modal:false
+    colorpicker cp13 "" pos:[241,522] width:22 height:24 modal:false
+    colorpicker cp14 "" pos:[260,522] width:22 height:24 modal:false
+    colorpicker cp15 "" pos:[279,522] width:22 height:24 modal:false
+    colorpicker cp16 "" pos:[298,522] width:22 height:24 modal:false
 
-    mapbutton map_fstorm "<drag to slot>" pos:[15,442] width:310 height:26 tooltip:"FStorm Random Color map — drag into any map slot"
+    label lbl_renderer "" pos:[15,553] width:310
+    mapbutton map_fstorm "FStorm RandomColor" pos:[15,575] width:310 height:26 enabled:false tooltip:"Requires installed FStorm and its RandomColor map"
+    mapbutton map_fstorm_multi "FStorm MultiTex" pos:[15,607] width:310 height:26 enabled:false tooltip:"Requires installed FStorm and its MultiTex map"
 
-    on ro_ThumbViewer open do (
+    mapbutton map_vray "V-Ray MultiSubTex" pos:[15,639] width:310 height:26 enabled:false
+    mapbutton map_corona "Corona MultiMap" pos:[15,671] width:310 height:26 enabled:false
+    mapbutton map_arnold "Arnold Switch RGBA" pos:[15,703] width:310 height:26 enabled:false tooltip:"Index selects the palette color (0-based); no random driver"
+    label lbl_copyright "© 2026 Klemens Neumann" pos:[15,738] width:310 align:#center
+
+    fn paletteSwatches = #(cp1,cp2,cp3,cp4,cp5,cp6,cp7,cp8,cp9,cp10,cp11,cp12,cp13,cp14,cp15,cp16)
+
+    fn refreshPaletteSwatches = (
+        local swatches = paletteSwatches()
+        for i = 1 to swatches.count do (
+            swatches[i].color = if i <= ce_DominantColors.count then ce_DominantColors[i] else ce_EmptySwatchColor
+        )
+    )
+
+    fn protectPaletteSwatches = (
+        if ce_ColorExtractor == undefined do ce_ColorExtractor = compileColorExtractor()
+        if ce_ColorExtractor == undefined do throw "Palette swatch protection could not initialize"
+        for swatch in paletteSwatches() do (
+            swatch.tooltip = "Extracted color; right-click Copy, then Paste into a destination swatch"
+            for hwnd in swatch.hwnd where (UIAccessor.GetWindowClassName hwnd) == "ColorSwatch" do (
+                ce_ColorExtractor.ProtectPaletteSwatch (hwnd as integer64)
+            )
+        )
+        if ce_ColorExtractor.ProtectedPaletteSwatchCount != (paletteSwatches()).count do throw "Not all palette swatches were protected"
+    )
+
+    fn updateBackgroundControls = (
+        local state = chk_background.checked
+        cp_background.enabled = state
+        btn_background.enabled = state
+        spn_threshold.enabled = state
+        spn_softness.enabled = state
+        chk_mask.enabled = state
+    )
+
+    fn readPreference key fallback = (
+        local raw = try (getINISetting preferencesFile "Preferences" key) catch ("")
+        if raw == "" do return fallback
+        if classOf fallback == BooleanClass then (
+            case (toLower raw) of (
+                "true": true
+                "false": false
+                default: fallback
+            )
+        ) else (
+            -- Cast numeric text only; never evaluate preferences as MAXScript.
+            local value = try (raw as float) catch (undefined)
+            local minimum = if key == "MaxColors" then ce_MinPaletteColors else 0.0
+            local maximum = if key == "MaxColors" then ce_MaxPaletteColors else ce_MaxMaskDistance
+            if value == undefined do return fallback
+            if (dotNetClass "System.Double").IsNaN value or (dotNetClass "System.Double").IsInfinity value do return fallback
+            if value < minimum or value > maximum do return fallback
+            if key == "MaxColors" then (if value == floor value then value as integer else fallback) else value
+        )
+    )
+
+    fn loadPreferences = (
+        preferencesReady = false
+        chk_background.checked = readPreference "IgnoreBackground" ce_DefaultIgnoreBackground
+        spn_threshold.value = readPreference "Threshold" ce_DefaultThreshold
+        spn_softness.value = readPreference "Softness" ce_DefaultSoftness
+        spn_colors.value = readPreference "MaxColors" ce_MaxPaletteColors
+        chk_linear.checked = readPreference "Linear" ce_DefaultLinear
+        updateBackgroundControls()
+        preferencesReady = true
+    )
+
+    fn savePreferences = (
+        if not preferencesReady do return false
+        try (
+            local values = #(
+                #("IgnoreBackground", chk_background.checked),
+                #("Threshold", spn_threshold.value),
+                #("Softness", spn_softness.value),
+                #("MaxColors", spn_colors.value),
+                #("Linear", chk_linear.checked)
+            )
+            for entry in values do (
+                if not (setINISetting preferencesFile "Preferences" entry[1] (entry[2] as string)) do throw "Could not write preferences file"
+            )
+            true
+        ) catch (
+            format "Color Extractor preferences could not be saved: %\n" (getCurrentException())
+            false
+        )
+    )
+
+    -- Shared output descriptors keep discovery, lifecycle and UI in sync.
+    fn outputSpecs = #(
+        #(map_fstorm, #randomColor, "FStorm RandomColor"),
+        #(map_fstorm_multi, #multiTex, "FStorm MultiTex"),
+        #(map_vray, #vray, "V-Ray MultiSubTex"),
+        #(map_corona, #corona, "Corona MultiMap"),
+        #(map_arnold, #arnold, "Arnold Switch RGBA")
+    )
+
+    fn cancelBackgroundPick = (
+        btn_background.checked = false
+        pb.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Default
+    )
+
+    fn clearMapOutputs = (
+        for spec in outputSpecs() do (
+            spec[1].map = undefined
+            spec[1].text = spec[3]
+            spec[1].enabled = false
+        )
+    )
+
+    fn hasMapSupport mapKind = (paletteMapClass installedMapSupport mapKind) != undefined
+
+    fn rebuildMapOutputs = (
+        clearMapOutputs()
+        local available = 0
+        local created = 0
+        for spec in outputSpecs() do (
+            local control = spec[1]
+            local kind = spec[2]
+            local title = spec[3]
+            control.tooltip = title + ": map class is not installed"
+            if hasMapSupport kind do (
+                available += 1
+                control.tooltip = if kind == #arnold then "Extract colors to enable Arnold; Index selects the palette color (0-based)" else "Extract colors to enable " + title
+                if ce_DominantColors.count > 0 do try (
+                    local output = createPaletteMap installedMapSupport kind ce_DominantColors
+                    if output == undefined do throw "No usable palette slots"
+                    local m = output.texture
+                    local n = output.colorCount
+                    control.map = m
+                    control.text = title + " (" + n as string + ") - drag to slot"
+                    control.tooltip = case kind of (
+                        #randomColor: "Palette colors with equal chances"
+                        #vray: "Sequential IDs 1..N; default ID selection; equal probabilities in Random mode"
+                        #corona: "Random by instance; equal frequencies; no color variation"
+                        #arnold: ("Palette in inputs 0.." + (n-1) as string + "; Index selects the color; no random driver")
+                        default: "Sequential IDs; palette colors without texture overrides"
+                    )
+                    control.enabled = true
+                    created += 1
+                ) catch (
+                    control.map = undefined
+                    control.tooltip = title + " creation failed; see Listener"
+                    format "% output error: %\n" title (getCurrentException())
+                )
+            )
+        )
+        lbl_renderer.text = if available > 0 then ("Installed palette map types: " + available as string) else "No supported renderer maps installed"
+        if ce_DominantColors.count > 0 do (
+            lbl_status.text = if created > 0 then "Palette ready - drag a map below." else if available > 0 then "Palette maps failed. See Listener." else "Palette ready; no supported maps installed."
+        )
+        true
+    )
+
+    fn acceptOutputMap kind theMap = (
+        local expectedClass = paletteMapClass installedMapSupport kind
+        if expectedClass == undefined or (theMap != undefined and classOf theMap != expectedClass) do (
+            rebuildMapOutputs()
+            lbl_status.text = "Use the matching map type for this output."
+        )
+    )
+
+    fn clearOutputMap control title = (
+        control.map = undefined
+        control.enabled = false
+        control.text = title
+        lbl_status.text = "Map cleared."
+    )
+
+    fn invalidatePalette = (
+        ce_DominantColors = #()
+        clearMapOutputs()
+        refreshPaletteSwatches()
+    )
+
+    fn configureBackground = (
+        if ce_ColorExtractor != undefined do (
+            local c = cp_background.color
+            ce_ColorExtractor.ConfigureMask chk_background.checked (c.r as integer) (c.g as integer) (c.b as integer) spn_threshold.value spn_softness.value
+        )
+    )
+
+    fn disposePreview = (
+        pb.Image = undefined
+        if ce_PreviewBitmap != undefined do (
+            ce_PreviewBitmap.Dispose()
+            ce_PreviewBitmap = undefined
+        )
+    )
+
+    fn refreshPreview = (
+        disposePreview()
+        if ce_ThumbBitmap != undefined do (
+            configureBackground()
+            try (
+                if chk_background.checked and chk_mask.checked then (
+                    ce_PreviewBitmap = ce_ColorExtractor.CreateMaskPreview ce_ThumbBitmap
+                    pb.Image = ce_PreviewBitmap
+                ) else pb.Image = ce_ThumbBitmap
+            ) catch (
+                pb.Image = ce_ThumbBitmap
+                lbl_status.text = "Mask preview failed; see Listener."
+                format "Mask preview error: %\n" (getCurrentException())
+            )
+        )
+    )
+
+    fn backgroundChanged = (
+        invalidatePalette()
+        refreshPreview()
+        if ce_ThumbBitmap != undefined do lbl_status.text = "Settings changed - click Extract Colors."
+    )
+
+    fn releaseImage = (
+        cancelBackgroundPick()
+        disposePreview()
+        if ce_ThumbBitmap != undefined do (
+            ce_ThumbBitmap.Dispose()
+            ce_ThumbBitmap = undefined
+        )
+        invalidatePalette()
+    )
+
+    fn loadSource src = (
+        releaseImage()
+        lbl_info.text = ""
+        ce_ThumbBitmap = loadThumbBitmap src 310 290
+        if ce_ThumbBitmap != undefined then (
+            refreshPreview()
+            lbl_info.text = (filenameFromPath src) + "  (" + (ce_ThumbBitmap.Width as string) + "x" + (ce_ThumbBitmap.Height as string) + ")"
+            lbl_status.text = "Ready - click Extract Colors."
+        ) else lbl_status.text = "Failed to load image; see Listener."
+        ce_ThumbBitmap != undefined
+    )
+
+    fn pickBackgroundAt x y = (
+        if ce_ThumbBitmap == undefined do return false
+        local picked = ce_ColorExtractor.PickPixel ce_ThumbBitmap pb.ClientSize.Width pb.ClientSize.Height x y
+        if picked.count == 3 then (
+            cp_background.color = color picked[1] picked[2] picked[3]
+            cancelBackgroundPick()
+            backgroundChanged()
+            true
+        ) else (
+            lbl_status.text = "Click inside the image on a visible pixel."
+            false
+        )
+    )
+
+    on ColorExtractor_rollout open do (
         pb.SizeMode    = (dotNetClass "System.Windows.Forms.PictureBoxSizeMode").Zoom
         pb.BackColor   = (dotNetClass "System.Drawing.Color").FromArgb 45 45 48
         pb.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").FixedSingle
+        -- Initialize every output to None before inspecting plugin availability.
+        invalidatePalette()
+        loadPreferences()
+        protectPaletteSwatches()
+        -- Discover installed renderer/map classes once per tool session.
+        installedMapSupport = discoverPaletteMapSupport()
+        rebuildMapOutputs()
     )
 
-    on ro_ThumbViewer close do (
-        pb.Image = undefined
-        if ce_ThumbBitmap != undefined do ( ce_ThumbBitmap.Dispose(); ce_ThumbBitmap = undefined )
-        ce_ColorExtractor = undefined   -- release compiled assembly
+    on ColorExtractor_rollout close do (
+        savePreferences()
+        releaseImage()
+        if ce_ColorExtractor != undefined do ce_ColorExtractor.ReleasePaletteSwatches()
+        ce_ColorExtractor = undefined -- assembly stays loaded until Max exits
+    )
+
+
+    on chk_background changed state do (
+        updateBackgroundControls()
+        cancelBackgroundPick()
+        backgroundChanged()
+        savePreferences()
+    )
+    on cp_background changed c do backgroundChanged()
+    on spn_threshold changed value do (backgroundChanged(); savePreferences())
+    on spn_softness changed value do (backgroundChanged(); savePreferences())
+    on chk_mask changed state do refreshPreview()
+    on chk_linear changed state do (
+        invalidatePalette()
+        if ce_ThumbBitmap != undefined do lbl_status.text = "Output changed - click Extract Colors."
+        savePreferences()
+    )
+    on spn_colors changed value do (
+        invalidatePalette()
+        if ce_ThumbBitmap != undefined do lbl_status.text = "Color count changed - click Extract Colors."
+        savePreferences()
+    )
+    on btn_background changed state do (
+        if state and ce_ThumbBitmap != undefined then (
+            pb.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Cross
+            lbl_status.text = "Click background in image; right-click cancels."
+        ) else (
+            cancelBackgroundPick()
+            if ce_ThumbBitmap == undefined do lbl_status.text = "Load an image first."
+        )
+    )
+    on pb MouseDown e do (
+        if btn_background.checked and ce_ThumbBitmap != undefined do (
+            if e.Button == (dotNetClass "System.Windows.Forms.MouseButtons").Right then (
+                cancelBackgroundPick()
+                lbl_status.text = "Background picking canceled."
+            ) else if e.Button == (dotNetClass "System.Windows.Forms.MouseButtons").Left do (
+                pickBackgroundAt e.X e.Y
+            )
+        )
     )
 
     on btn_pick pressed do (
         local src = getOpenFileName caption:"Pick source image" types:"Images|*.jpg;*.jpeg;*.png;*.tif;*.tga;*.bmp;*.exr|All|*.*"
-        if src != undefined do (
-            if ce_ThumbBitmap != undefined do ( pb.Image = undefined; ce_ThumbBitmap.Dispose(); ce_ThumbBitmap = undefined )
-            ce_ThumbBitmap = loadThumbBitmap src 310 290
-            if ce_ThumbBitmap != undefined then (
-                pb.Image = ce_ThumbBitmap
-                lbl_info.text   = (filenameFromPath src) + "  (" + (ce_ThumbBitmap.Width as string) + "x" + (ce_ThumbBitmap.Height as string) + ")"
-                lbl_status.text = "Ready — click Extract Colors"
-            ) else lbl_info.text = "Failed to load image."
-        )
+        if src != undefined do loadSource src
     )
 
     on btn_clear pressed do (
-        pb.Image = undefined
-        if ce_ThumbBitmap != undefined do ( ce_ThumbBitmap.Dispose(); ce_ThumbBitmap = undefined )
-        lbl_info.text = ""; lbl_status.text = ""
+        releaseImage()
+        lbl_info.text = ""
+        lbl_status.text = ""
     )
 
     on btn_extract pressed do (
@@ -594,54 +1163,53 @@ rollout ColorExtractor_rollout ("Color Extractor v" + ce_Version) width:340 heig
             lbl_status.text = "Extracting… (compiling C# on first run)"
             windows.processPostedMessages()
 
-            ce_DominantColors = extractDominantColors ce_ThumbBitmap numColors:16 blurStrength:2 maxSamples:1000 toLinear:chk_linear.checked
+            cancelBackgroundPick()
+            invalidatePalette()
+            configureBackground()
+            ce_DominantColors = extractDominantColors ce_ThumbBitmap numColors:spn_colors.value blurStrength:ce_ExtractionBlurPasses maxSamples:ce_ExtractionMaxSamples toLinear:chk_linear.checked
 
-            local cpList = #(cp1,cp2,cp3,cp4,cp5,cp6,cp7,cp8,cp9,cp10,cp11,cp12,cp13,cp14,cp15,cp16)
-            for i = 1 to 16 do
-                cpList[i].color = if i <= ce_DominantColors.count then ce_DominantColors[i] else (color 20 20 20)
-			
-			local RENDERER_FSTORM = matchPattern (renderers.current as string) pattern:"FStormRender_*"
+            refreshPaletteSwatches()
 
-			if ce_DominantColors.count == 0 then
+            if ce_DominantColors.count == 0 then
 			(
-				lbl_status.text = "No colors extracted."
+				lbl_status.text = "No foreground pixels remain, or extraction failed."
 			)
-			else if RENDERER_FSTORM then
-			(
-				-- Build FStormRandomColor map and assign to the mapbutton
-				local m = FStormRandomColor()
-				local colorLimit = fstormRandomColorLimit ((classOf renderers.current) as string)
-				-- Assigning an 8-element array to an older 4-slot map raises:
-				-- "Array parameter size fixed, cannot dynamically alter: colors".
-				-- Update slots individually and also clamp to the actual parameter sizes,
-				-- since the version check alone cannot guarantee the installed map layout.
-				local n = amin #(colorLimit, m.colors.count, m.chances.count, ce_DominantColors.count)
-				for i = 1 to n do m.colors[i] = ce_DominantColors[i]
-				for i = 1 to m.chances.count do
-					m.chances[i] = if i <= n then (1.0 / n) else 0.0
-				m.id_source  = 0
-				m.mix_value  = 1.0
-				m.random_seed = 42
-				map_fstorm.map  = m
-				map_fstorm.text = m.name
-				lbl_status.text = ("Done (" + (if chk_linear.checked then "linear" else "sRGB") + ") — ce_DominantColors[1..16] ready")
-			)
-			else(
-				lbl_status.text = ("Fstorm is not set as renderer.")
-			)
+            else rebuildMapOutputs()
         )
     )
 
-    on map_fstorm picked theMap do ()
+    -- Incoming paste/drop operations cannot change the extracted palette.
+    on cp1 changed c do refreshPaletteSwatches()
+    on cp2 changed c do refreshPaletteSwatches()
+    on cp3 changed c do refreshPaletteSwatches()
+    on cp4 changed c do refreshPaletteSwatches()
+    on cp5 changed c do refreshPaletteSwatches()
+    on cp6 changed c do refreshPaletteSwatches()
+    on cp7 changed c do refreshPaletteSwatches()
+    on cp8 changed c do refreshPaletteSwatches()
+    on cp9 changed c do refreshPaletteSwatches()
+    on cp10 changed c do refreshPaletteSwatches()
+    on cp11 changed c do refreshPaletteSwatches()
+    on cp12 changed c do refreshPaletteSwatches()
+    on cp13 changed c do refreshPaletteSwatches()
+    on cp14 changed c do refreshPaletteSwatches()
+    on cp15 changed c do refreshPaletteSwatches()
+    on cp16 changed c do refreshPaletteSwatches()
 
-    on map_fstorm rightclick do (
-        if map_fstorm.map != undefined do (
-            map_fstorm.map = undefined
-            lbl_status.text = "Map cleared."
-        )
-    )
+    -- Reject incompatible incoming maps; dragging generated maps out still works.
+    on map_fstorm picked m do acceptOutputMap #randomColor m
+    on map_fstorm_multi picked m do acceptOutputMap #multiTex m
+    on map_vray picked m do acceptOutputMap #vray m
+    on map_corona picked m do acceptOutputMap #corona m
+    on map_arnold picked m do acceptOutputMap #arnold m
+    on map_fstorm rightclick do clearOutputMap map_fstorm "FStorm RandomColor"
+    on map_fstorm_multi rightclick do clearOutputMap map_fstorm_multi "FStorm MultiTex"
+    on map_vray rightclick do clearOutputMap map_vray "V-Ray MultiSubTex"
+    on map_corona rightclick do clearOutputMap map_corona "Corona MultiMap"
+    on map_arnold rightclick do clearOutputMap map_arnold "Arnold Switch RGBA"
+
 )
 
 -- Launch
-createDialog ColorExtractor_rollout style:#(#style_titlebar, #style_sysmenu, #style_resizing)
+createDialog ColorExtractor_rollout style:#(#style_titlebar, #style_sysmenu)
 )
