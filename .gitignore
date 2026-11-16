@@ -1,10 +1,25 @@
 # Local editor settings
 .vs/
 .vscode/
+.docs/
+*.user
+*.suo
 
 # Temporary and backup files
 *.tmp
 *.bak
 *.autosave
+*.log
 Thumbs.db
 Desktop.ini
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+ColorExtractor.ini
+
+# Build artifacts
+[Bb]in/
+[Oo]bj/
+*.pdb
