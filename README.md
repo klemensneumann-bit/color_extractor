@@ -8,6 +8,8 @@ A personal helper shared as-is under the [MIT License](LICENSE). Updates and sup
 
 ## Usage
 
+To use the tool, just run `ColorExtractor.ms` in 3ds Max as described below. The validation tests are for developers and are not required for normal use.
+
 1. Run `ColorExtractor.ms` through **Scripting > Run Script**.
 2. Click **Pick image** to load a reference image.
 3. Optionally enable **Ignore background**. Use **Pick from image** or the background color swatch to choose the color to exclude. Adjust **Threshold** and **Softness**; **Show mask** displays excluded pixels in magenta. Right-click the image to cancel picking.
@@ -54,9 +56,13 @@ Background exclusion uses Lab color distance (Delta E 76). Pixels at or below **
 
 Masked and transparent sources bypass extraction blur to avoid background bleed. Alpha reduces pixel influence when retained by the thumbnail loader. The magenta overlay never enters extraction.
 
-## Requirements and validation
+## Requirements
 
 Requires 3ds Max on Windows with its .NET components. Renderer outputs require their corresponding installed plugins. Plugin APIs have been checked in 3ds Max 2024; other plugin versions may expose different properties.
+
+## Developer validation
+
+The following checks are for developers testing changes to the tool. Users do not need to run them.
 
 The script uses a native MAXScript UI, a .NET image preview, and an embedded C# helper compiled at runtime. Temporary compiler source is cleaned up after compilation. Palette swatches retain Max's native color clipboard; an input guard prevents opening their color editor, and incoming paste/drop changes are reset to extracted values.
 
